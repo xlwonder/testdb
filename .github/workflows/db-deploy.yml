@@ -1,0 +1,133 @@
+name: DB Auto-Migrate on Merge
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - 'release/**'
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-db:
+    runs-on: ubuntu-latest
+    env:
+      # default DB name (override by parsing connection string below if present)
+      DEFAULT_DB: master
+
+    steps:
+      # 1) Checkout full history (needed to detect diffs reliably)
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2) Detect added or modified .sql files under any /Upgrade/ folder
+      - name: Detect DB SQL changes
+        id: db_changes
+        uses: dorny/paths-filter@v3
+        with:
+          list-files: json
+          filters: |
+            db:
+              - 'added|modified: **/Upgrade/**/**/*.sql'
+
+      # 3) Skip entirely when no DB files changed
+      - name: Skip if no DB SQL changes
+        if: steps.db_changes.outputs.db == 'false'
+        run: |
+          echo "No database SQL changes detected. Skipping DB deployment."
+
+      # 4) Map branch -> connection secret (set DB_CONN environment var)
+      #     Note: GitHub Actions does not allow dynamic secret name lookup,
+      #     so we do per-branch conditional steps and load the correct secret.
+      - name: Set DB_CONN for main
+        if: steps.db_changes.outputs.db == 'true' && github.ref == 'refs/heads/main'
+        run: echo "DB_CONN=${{ secrets.DB_CONN_MAIN }}" >> $GITHUB_ENV
+
+      - name: Set DB_CONN for develop
+        if: steps.db_changes.outputs.db == 'true' && github.ref == 'refs/heads/develop'
+        run: echo "DB_CONN=${{ secrets.DB_CONN_DEVELOP }}" >> $GITHUB_ENV
+
+      - name: Set DB_CONN for release/*
+        if: steps.db_changes.outputs.db == 'true' && startsWith(github.ref, 'refs/heads/release/')
+        run: echo "DB_CONN=${{ secrets.DB_CONN_RELEASE }}" >> $GITHUB_ENV
+
+      # 5) Parse simple "key=value;key=value;" connection string into pieces
+      - name: Parse DB_CONN into DB_SERVER, DB_NAME, DB_USER, DB_PASS
+        if: steps.db_changes.outputs.db == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # expect DB_CONN as "Server=host,port;Database=MyDb;User Id=user;Password=pass;"
+          : "${DB_CONN:?DB_CONN secret not set — check branch-to-secret mapping}"
+          # lower-case and remove spaces around '=' for simple parsing
+          cs=$(echo "$DB_CONN" | sed 's/ *; */;/g')
+          # helper to extract value from key (case-insensitive)
+          extract() {
+            echo "$cs" | tr ';' '\n' | awk -F= -v k="$(echo "$1" | tr '[:upper:]' '[:lower:]')" '{key=tolower($1); if(key==k) print substr($0, index($0,"=")+1)}'
+          }
+          echo "DB_SERVER=$(extract 'Server' || extract 'Data Source' || true)" >> $GITHUB_ENV
+          echo "DB_NAME=$(extract 'Database' || true)" >> $GITHUB_ENV
+          echo "DB_USER=$(extract 'User Id' || extract 'UID' || true)" >> $GITHUB_ENV
+          echo "DB_PASS=$(extract 'Password' || extract 'PWD' || true)" >> $GITHUB_ENV
+
+      # 6) Install mssql-tools/sqlcmd on the runner (Ubuntu). See MS docs for alternative distros.
+      - name: Install mssql-tools (sqlcmd)
+        if: steps.db_changes.outputs.db == 'true'
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y curl apt-transport-https gnupg ca-certificates lsb-release
+          curl -sSL https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+          DISTRO=$(lsb_release -is | tr '[:upper:]' '[:lower:]')$(lsb_release -rs)
+          # Use the recommended repo for Ubuntu (adjust for your runner distro if needed)
+          curl -sSL https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql17 mssql-tools unixodbc-dev
+          echo 'PATH="$PATH:/opt/mssql-tools/bin"' >> $GITHUB_ENV
+      # (Reference: Microsoft docs for installing mssql-tools on Linux.) 
+
+      # 7) Prepare migrations table if missing, then run new scripts in order
+      - name: Run new DB scripts (safe apply + record)
+        if: steps.db_changes.outputs.db == 'true'
+        shell: bash
+        env:
+          DB_SERVER: ${{ env.DB_SERVER }}
+          DB_NAME: ${{ env.DB_NAME || env.DEFAULT_DB }}
+          DB_USER: ${{ env.DB_USER }}
+          DB_PASS: ${{ env.DB_PASS }}
+        run: |
+          set -euo pipefail
+          # don't echo secret values
+          SQLCMD="/opt/mssql-tools/bin/sqlcmd -S \"$DB_SERVER\" -d \"$DB_NAME\" -U \"$DB_USER\" -P \"$DB_PASS\" -b -r1"
+          # Ensure schema_migrations table exists
+          $SQLCMD -Q "IF OBJECT_ID('dbo.schema_migrations','U') IS NULL BEGIN CREATE TABLE dbo.schema_migrations(script NVARCHAR(1024) PRIMARY KEY, applied_at DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET()); END"
+          # Build an ordered list of files from paths-filter output
+          # db_files: JSON array e.g. ["path/a.sql","path/b.sql"]
+          DB_FILES_JSON='${{ steps.db_changes.outputs.db_files }}'
+          if [ -z "$DB_FILES_JSON" ] || [ "$DB_FILES_JSON" = "null" ]; then
+            echo "No file list returned; nothing to run."
+            exit 0
+          fi
+          # Use jq (available on ubuntu-latest); if not present, you can install it.
+          FILES=$(echo "$DB_FILES_JSON" | jq -r '.[]' | sort)
+          for f in $FILES; do
+            echo "Processing $f"
+            # use the path in repo as script identifier
+            script_id="$f"
+            # check if applied
+            count=$($SQLCMD -h -1 -W -Q "SET NOCOUNT ON; SELECT COUNT(1) FROM dbo.schema_migrations WHERE script = N'$script_id';")
+            count=$(echo "$count" | tr -d '[:space:]')
+            if [ "$count" = "0" ] || [ -z "$count" ]; then
+              echo "Applying $f"
+              /opt/mssql-tools/bin/sqlcmd -S "$DB_SERVER" -d "$DB_NAME" -U "$DB_USER" -P "$DB_PASS" -i "$f" || { echo "Script $f failed"; exit 1; }
+              # record it
+              $SQLCMD -Q "INSERT INTO dbo.schema_migrations (script) VALUES (N'$script_id');"
+              echo "Recorded $f in schema_migrations."
+            else
+              echo "Skipping $f — already applied."
+            fi
+          done
