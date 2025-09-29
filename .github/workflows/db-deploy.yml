@@ -32,7 +32,7 @@ jobs:
           list-files: json
           filters: |
             db:
-              - 'added|modified: **/Upgrade/**/*.sql'
+              - added|modified: '**/Upgrade/**/*.sql'
 
       # 3) Skip entirely when no DB files changed
       - name: Skip if no DB SQL changes
